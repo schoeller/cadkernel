@@ -130,6 +130,9 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 pointer(coedge),
                 pointer(ids.curve(edge.curve)),
                 sense(true),
+                // ACIS edge records terminate in a counted "unknown" string;
+                // strict readers expect it after the sense keyword.
+                SatToken::String("unknown".to_string()),
             ],
         );
     }
@@ -225,6 +228,10 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
         body_id,
         vec![null(), pointer(first_lump), null(), null()],
     );
+
+    // The header's body count must reflect every body in the document; a
+    // strict reader rejects a stream whose header undercounts the records.
+    document.header.num_bodies += 1;
 
     Ok(Written {
         body: body_id,
@@ -452,7 +459,17 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
     Some(match surface {
         Surface::Plane(_) => (
             "plane-surface",
-            vec![position(origin), position(normal), position(u)],
+            vec![
+                position(origin),
+                position(normal),
+                position(u),
+                // plane-surface carries `forward_v`, then four bound flags.
+                SatToken::Ident("forward_v".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+            ],
         ),
         Surface::Cylinder(cylinder) => (
             "cone-surface",
@@ -469,6 +486,11 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
                 SatToken::Float(sphere.radius),
                 position(u),
                 position(normal),
+                SatToken::Ident("forward_v".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
             ],
         ),
         Surface::Torus(torus) => (
@@ -479,6 +501,11 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
                 SatToken::Float(torus.major_radius),
                 SatToken::Float(torus.minor_radius),
                 position(u),
+                SatToken::Ident("forward_v".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
             ],
         ),
         Surface::Nurbs(_) => return None,
@@ -492,6 +519,11 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
 /// is read back; a unit major axis with the radius beside it produces a cone
 /// of radius one. The two continuation tokens before the half-angle are not
 /// decoration: the reader looks for the sine at thirteen.
+///
+/// The trailing `forward I I I I` (sense + four bound flags) is mandatory —
+/// ACIS/ASM readers index these fields positionally and reject a cone-surface
+/// record that ends early, which is exactly what a strict consumer (BricsCAD)
+/// does with a truncated record.
 fn cone_tokens(
     origin: [f64; 3],
     axis: [f64; 3],
@@ -511,6 +543,12 @@ fn cone_tokens(
         SatToken::Float(sine),
         SatToken::Float(cosine),
         SatToken::Float(radius),
+        // cone-surface carries `forward` (not `forward_v`), then four bounds.
+        SatToken::Ident("forward".to_string()),
+        SatToken::Ident("I".to_string()),
+        SatToken::Ident("I".to_string()),
+        SatToken::Ident("I".to_string()),
+        SatToken::Ident("I".to_string()),
     ]
 }
 
@@ -518,7 +556,13 @@ pub(super) fn curve_record(curve: &Curve3) -> Option<(&'static str, Vec<SatToken
     Some(match curve {
         Curve3::Line(line) => (
             "straight-curve",
-            vec![position(line.origin), position(line.direction)],
+            vec![
+                position(line.origin),
+                position(line.direction),
+                // straight-curve closes with two bound flags (I I).
+                SatToken::Ident("I".to_string()),
+                SatToken::Ident("I".to_string()),
+            ],
         ),
         Curve3::Circle(circle) => (
             "ellipse-curve",
@@ -556,6 +600,9 @@ fn ellipse_tokens(
         position(normal),
         position((Vec3::from(u) * radius).to_array()),
         SatToken::Float(ratio),
+        // Two bound flags (I I) close the record; ACIS expects them.
+        SatToken::Ident("I".to_string()),
+        SatToken::Ident("I".to_string()),
     ]
 }
 
@@ -574,3 +621,96 @@ pub(super) fn null() -> SatToken {
 fn sense(forward: bool) -> SatToken {
     SatToken::Ident(if forward { "forward" } else { "reversed" }.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadcodec::entities::acis::{SabReader, SabWriter};
+
+    /// Build the reported cylinder (centre 0,0,0, radius 1, height 2) and append it.
+    fn cylinder_document() -> SatDocument {
+        let body = crate::brep::make::cylinder([0.0, 0.0, 0.0], 1.0, 2.0)
+            .expect("kernel should build a cylinder body");
+        let mut document = SatDocument::new();
+        append(&body, &mut document).expect("cylinder should append");
+        document
+    }
+
+    fn tokens_of<'a>(document: &'a SatDocument, entity_type: &str) -> Vec<&'a [SatToken]> {
+        document
+            .records
+            .iter()
+            .filter(|record| record.entity_type == entity_type)
+            .map(|record| record.tokens.as_slice())
+            .collect()
+    }
+
+    fn ends_with_idents(tokens: &[SatToken], expected: &[&str]) -> bool {
+        let tail = &tokens[tokens.len() - expected.len()..];
+        tail.iter().zip(expected).all(|(token, want)| {
+            matches!(token, SatToken::Ident(name) if name == want)
+        })
+    }
+
+    #[test]
+    fn appended_cylinder_records_carry_their_mandatory_trailing_fields() {
+        let document = cylinder_document();
+
+        // Header must count the body it contains.
+        assert_eq!(document.header.num_bodies, 1, "num_bodies");
+
+        for tokens in tokens_of(&document, "plane-surface") {
+            assert!(
+                ends_with_idents(tokens, &["forward_v", "I", "I", "I", "I"]),
+                "plane-surface missing forward_v I I I I: {tokens:?}"
+            );
+        }
+        for tokens in tokens_of(&document, "cone-surface") {
+            assert!(
+                ends_with_idents(tokens, &["forward", "I", "I", "I", "I"]),
+                "cone-surface missing forward I I I I: {tokens:?}"
+            );
+        }
+        for tokens in tokens_of(&document, "ellipse-curve") {
+            assert!(
+                ends_with_idents(tokens, &["I", "I"]),
+                "ellipse-curve missing trailing I I: {tokens:?}"
+            );
+        }
+        for tokens in tokens_of(&document, "straight-curve") {
+            assert!(
+                ends_with_idents(tokens, &["I", "I"]),
+                "straight-curve missing trailing I I: {tokens:?}"
+            );
+        }
+        for tokens in tokens_of(&document, "edge") {
+            assert!(
+                matches!(tokens.last(), Some(SatToken::String(s)) if s == "unknown"),
+                "edge missing trailing \"unknown\" string: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn appended_cylinder_survives_sab_roundtrip() {
+        let document = cylinder_document();
+        let text = document.to_sat_string();
+        let mut reparsed = SatDocument::parse(&text).expect("emitted SAT should re-parse");
+        // Mirror the writer path: strip non-geometry records, then validate the
+        // pointer graph before serializing to SAB.
+        reparsed.strip_for_sab();
+        assert!(
+            reparsed.validate().is_empty(),
+            "appended cylinder SAT should validate after strip_for_sab"
+        );
+        let sab = SabWriter::write(&reparsed);
+        let readback = SabReader::read(&sab).expect("SAB should read back");
+        assert!(readback.validate().is_empty(), "SAB round-trip invalid");
+
+        let (bodies, loss) = crate::acis::lift(&readback);
+        assert!(loss.is_empty(), "lift loss after SAB round-trip: {loss:?}");
+        assert_eq!(bodies.len(), 1, "expected exactly one body back");
+        assert!(bodies[0].validate().is_empty(), "lifted body should be valid");
+    }
+}
+
